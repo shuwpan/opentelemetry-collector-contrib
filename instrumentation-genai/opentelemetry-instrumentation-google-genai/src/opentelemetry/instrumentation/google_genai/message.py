@@ -93,6 +93,11 @@ def _to_input_message(
 
 
 def _to_part(part: genai_types.Part, idx: int) -> MessagePart | None:
+    # Thinking-model parts (e.g. Gemini 2.5) have `thought=True`.
+    # These are internal chain-of-thought and should not appear in telemetry.
+    if getattr(part, "thought", False):
+        return None
+
     def tool_call_id(name: str | None) -> str:
         if name:
             return f"{name}_{idx}"
@@ -135,22 +140,48 @@ def _to_role(role: str | None) -> str:
     return ""
 
 
+_CONTENT_FILTER_REASONS: frozenset[genai_types.FinishReason] = frozenset(
+    r
+    for name in (
+        "SAFETY",
+        "IMAGE_SAFETY",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "IMAGE_PROHIBITED_CONTENT",
+        "SPII",
+        "RECITATION",
+        "IMAGE_RECITATION",
+        "LANGUAGE",
+    )
+    if (r := getattr(genai_types.FinishReason, name, None)) is not None
+)
+
+_ERROR_REASONS: frozenset[genai_types.FinishReason] = frozenset(
+    r
+    for name in (
+        "FINISH_REASON_UNSPECIFIED",
+        "OTHER",
+        "IMAGE_OTHER",
+        "UNEXPECTED_TOOL_CALL",
+        "MALFORMED_FUNCTION_CALL",
+        "NO_IMAGE",
+    )
+    if (r := getattr(genai_types.FinishReason, name, None)) is not None
+)
+
+
 def _to_finish_reason(
     finish_reason: genai_types.FinishReason | None,
 ) -> FinishReason | str:
     if finish_reason is None:
         return ""
-    if (
-        finish_reason is genai_types.FinishReason.FINISH_REASON_UNSPECIFIED
-        or finish_reason is genai_types.FinishReason.OTHER
-    ):
+    if finish_reason in _ERROR_REASONS:
         return "error"
     if finish_reason is genai_types.FinishReason.STOP:
         return "stop"
     if finish_reason is genai_types.FinishReason.MAX_TOKENS:
         return "length"
-    if finish_reason is genai_types.FinishReason.SAFETY:
+    if finish_reason in _CONTENT_FILTER_REASONS:
         return "content_filter"
-
-    # If there is no 1:1 mapping to an OTel preferred enum value, use the exact vertex reason
+    # If there is no 1:1 mapping to an OTel preferred enum value, use the exact reason
     return finish_reason.name.lower()

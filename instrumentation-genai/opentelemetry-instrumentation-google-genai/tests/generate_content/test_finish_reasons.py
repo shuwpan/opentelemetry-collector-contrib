@@ -110,6 +110,66 @@ class FinishReasonsTestCase(TestCase):
             ["content_filter", "length", "stop"],
         )
 
+    def test_blocklist_maps_to_content_filter(self):
+        self.configure_valid_response(
+            candidate=genai_types.Candidate(
+                finish_reason=genai_types.FinishReason.BLOCKLIST
+            )
+        )
+        self.assertEqual(
+            self.generate_and_get_span_finish_reasons(), ["content_filter"]
+        )
+
+    def test_recitation_maps_to_content_filter(self):
+        self.configure_valid_response(
+            candidate=genai_types.Candidate(
+                finish_reason=genai_types.FinishReason.RECITATION
+            )
+        )
+        self.assertEqual(
+            self.generate_and_get_span_finish_reasons(), ["content_filter"]
+        )
+
+    def test_spii_maps_to_content_filter(self):
+        self.configure_valid_response(
+            candidate=genai_types.Candidate(
+                finish_reason=genai_types.FinishReason.SPII
+            )
+        )
+        self.assertEqual(
+            self.generate_and_get_span_finish_reasons(), ["content_filter"]
+        )
+
+    def test_malformed_function_call_maps_to_error(self):
+        self.configure_valid_response(
+            candidate=genai_types.Candidate(
+                finish_reason=genai_types.FinishReason.MALFORMED_FUNCTION_CALL
+            )
+        )
+        self.assertEqual(
+            self.generate_and_get_span_finish_reasons(), ["error"]
+        )
+
+    def test_unexpected_tool_call_maps_to_error(self):
+        self.configure_valid_response(
+            candidate=genai_types.Candidate(
+                finish_reason=genai_types.FinishReason.UNEXPECTED_TOOL_CALL
+            )
+        )
+        self.assertEqual(
+            self.generate_and_get_span_finish_reasons(), ["error"]
+        )
+
+    def test_other_maps_to_error(self):
+        self.configure_valid_response(
+            candidate=genai_types.Candidate(
+                finish_reason=genai_types.FinishReason.OTHER
+            )
+        )
+        self.assertEqual(
+            self.generate_and_get_span_finish_reasons(), ["error"]
+        )
+
     def test_deduplicates_finish_reasons(self):
         self.configure_valid_response(
             candidates=[

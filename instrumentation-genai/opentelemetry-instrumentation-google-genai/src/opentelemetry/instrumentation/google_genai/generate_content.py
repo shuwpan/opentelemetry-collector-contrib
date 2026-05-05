@@ -35,6 +35,9 @@ from opentelemetry.semconv._incubating.attributes import (
     code_attributes,
     gen_ai_attributes,
 )
+from opentelemetry.util.genai.attributes import (
+    SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
+)
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.types import (
     Error,
@@ -312,8 +315,16 @@ def _build_invocation(
     # Standard semconv fields → typed LLMInvocation fields. Most Google config
     # field names match semconv directly; a couple use different words (noted
     # in the comments below).
+    backend = (
+        "vertex_ai"
+        if genai_system == _get_vertexai_system_name()
+        else "gemini"
+    )
+
     invocation = LLMInvocation(
         system=genai_system,
+        provider="google",
+        framework="google-genai-sdk",
         request_model=model,
         operation=_GENERATE_CONTENT_OP_NAME,
         input_messages=input_messages,
@@ -342,6 +353,10 @@ def _build_invocation(
         config_dict, allow_list
     )
     invocation.attributes.update(_get_extra_generate_content_attributes())
+
+    # Gemini-specific span attribute: which backend is being targeted.
+    invocation.attributes["gen_ai.google.request.backend"] = backend
+
     return invocation
 
 
@@ -376,9 +391,47 @@ def _apply_response(
     model_version = getattr(response, "model_version", None)
     if model_version:
         invocation.response_model_name = model_version
+        # Gemini-specific: actual resolved model version string
+        invocation.attributes["gen_ai.google.response.model_version"] = (
+            model_version
+        )
     response_id = getattr(response, "response_id", None)
     if response_id:
         invocation.response_id = response_id
+
+    # Gemini-specific usage attributes (set only when > 0)
+    thoughts_tokens = _get_response_property(
+        response, "usage_metadata.thoughts_token_count"
+    )
+    if isinstance(thoughts_tokens, int) and not isinstance(
+        thoughts_tokens, bool
+    ):
+        if thoughts_tokens > 0:
+            invocation.attributes["gen_ai.google.usage.thought_tokens"] = (
+                thoughts_tokens
+            )
+
+    tool_use_prompt_tokens = _get_response_property(
+        response, "usage_metadata.tool_use_prompt_token_count"
+    )
+    if isinstance(tool_use_prompt_tokens, int) and not isinstance(
+        tool_use_prompt_tokens, bool
+    ):
+        if tool_use_prompt_tokens > 0:
+            invocation.attributes[
+                "gen_ai.google.usage.tool_use_prompt_tokens"
+            ] = tool_use_prompt_tokens
+
+    cached_content_tokens = _get_response_property(
+        response, "usage_metadata.cached_content_token_count"
+    )
+    if isinstance(cached_content_tokens, int) and not isinstance(
+        cached_content_tokens, bool
+    ):
+        if cached_content_tokens > 0:
+            invocation.attributes[
+                "gen_ai.google.usage.cached_content_tokens"
+            ] = cached_content_tokens
 
     # Token counts. Guard against bool (isinstance(True, int) is True).
     input_tokens = _get_response_property(
@@ -438,6 +491,14 @@ def _create_instrumented_generate_content(
         config: Optional[GenerateContentConfigOrDict] = None,
         **kwargs: Any,
     ) -> GenerateContentResponse:
+        if context_api.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY):
+            return wrapped_func(
+                self,
+                model=model,
+                contents=contents,
+                config=config,
+                **kwargs,
+            )
         invocation = _build_invocation(
             self,
             model,
@@ -514,6 +575,14 @@ def _create_instrumented_async_generate_content(
         config: Optional[GenerateContentConfigOrDict] = None,
         **kwargs: Any,
     ) -> GenerateContentResponse:
+        if context_api.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY):
+            return await wrapped_func(
+                self,
+                model=model,
+                contents=contents,
+                config=config,
+                **kwargs,
+            )
         invocation = _build_invocation(
             self,
             model,
