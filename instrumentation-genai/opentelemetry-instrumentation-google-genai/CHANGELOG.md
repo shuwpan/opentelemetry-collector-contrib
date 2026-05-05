@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
--Add `gen_ai.usage.cache_read.input_tokens` attribute to capture cached tokens on spans/events when the experimental sem conv flag is set. ([#4313](https://github.com/open-telemetry/opentelemetry-python-contrib/pull/4313))
+- Migrate `generate_content` (sync + async) instrumentation to `TelemetryHandler` / `LLMInvocation` (HYBIM-663).
+- **BREAKING**: `generate_content_stream` / `async_generate_content_stream` are temporarily uninstrumented until HYBIM-665.
+- **BREAKING**: `inline_data`, `file_data`, and `function_call` message parts are temporarily dropped until HYBIM-604.
+- **BREAKING**: The `completion_hook` instrumentor kwarg is no longer supported.
 - Shorten Google GenAI e2e cassette filenames so the repository can be checked out on Windows runners.
 
 ## Version 0.7b0 (2026-02-20)

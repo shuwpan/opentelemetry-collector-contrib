@@ -15,6 +15,7 @@
 from unittest.mock import patch
 
 import google.genai.types as genai_types
+import pytest
 
 from opentelemetry.instrumentation._semconv import (
     _OpenTelemetrySemanticConventionStability,
@@ -24,6 +25,14 @@ from opentelemetry.instrumentation._semconv import (
 from opentelemetry.util.genai.types import ContentCapturingMode
 
 from .base import TestCase
+
+# Automatic function calling instrumentation is deferred to PR 3
+# (HYBIM-664). All assertions in this module rely on the upstream
+# ``tool_call_wrapper`` integration, which is not part of the PR 1
+# TelemetryHandler / LLMInvocation migration.
+pytestmark = pytest.mark.skip(
+    reason="Automatic function calling deferred to PR 3 (HYBIM-664)."
+)
 
 
 class ToolCallInstrumentationTestCase(TestCase):

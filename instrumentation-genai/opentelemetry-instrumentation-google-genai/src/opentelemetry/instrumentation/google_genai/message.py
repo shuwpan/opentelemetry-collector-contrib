@@ -20,15 +20,12 @@ from enum import Enum
 from google.genai import types as genai_types
 
 from opentelemetry.util.genai.types import (
-    Blob,
     FinishReason,
     InputMessage,
     MessagePart,
     OutputMessage,
     Text,
-    ToolCallRequest,
     ToolCallResponse,
-    Uri,
 )
 
 
@@ -104,30 +101,21 @@ def _to_part(part: genai_types.Part, idx: int) -> MessagePart | None:
     if (text := part.text) is not None:
         return Text(content=text)
 
-    if inline_data := part.inline_data:
-        mime_type = inline_data.mime_type or ""
-        modality = mime_type.split("/")[0] if mime_type else ""
-        return Blob(
-            mime_type=mime_type,
-            modality=modality,
-            content=inline_data.data or b"",
-        )
+    # Blob (inline_data), Uri (file_data), and ToolCallRequest (function_call)
+    # types are not yet available in util-genai. Skipped until HYBIM-604.
+    if part.inline_data:
+        _logger.debug("Skipping inline_data part (Blob type not available)")
+        return None
 
-    if file_data := part.file_data:
-        mime_type = file_data.mime_type or ""
-        modality = mime_type.split("/")[0] if mime_type else ""
-        return Uri(
-            mime_type=mime_type,
-            modality=modality,
-            uri=file_data.file_uri or "",
-        )
+    if part.file_data:
+        _logger.debug("Skipping file_data part (Uri type not available)")
+        return None
 
-    if call := part.function_call:
-        return ToolCallRequest(
-            id=call.id or tool_call_id(call.name),
-            name=call.name or "",
-            arguments=call.args,
+    if part.function_call:
+        _logger.debug(
+            "Skipping function_call part (ToolCallRequest type not available)"
         )
+        return None
 
     if response := part.function_response:
         return ToolCallResponse(
@@ -161,6 +149,8 @@ def _to_finish_reason(
         return "stop"
     if finish_reason is genai_types.FinishReason.MAX_TOKENS:
         return "length"
+    if finish_reason is genai_types.FinishReason.SAFETY:
+        return "content_filter"
 
     # If there is no 1:1 mapping to an OTel preferred enum value, use the exact vertex reason
-    return finish_reason.name
+    return finish_reason.name.lower()

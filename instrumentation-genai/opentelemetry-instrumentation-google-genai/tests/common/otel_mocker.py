@@ -52,6 +52,12 @@ def _bypass_otel_once():
     opentelemetry.trace._TRACER_PROVIDER_SET_ONCE = Once()
     opentelemetry._logs._internal._LOGGER_PROVIDER_SET_ONCE = Once()
     opentelemetry.metrics._internal._METER_PROVIDER_SET_ONCE = Once()
+    # Clear accumulated proxy meters — they cause a deadlock when
+    # restore() later calls set_meter_provider(_ProxyMeterProvider)
+    # because on_set_meter_provider holds _lock and the forwarded
+    # get_meter tries to re-acquire the same _lock.
+    opentelemetry.metrics._internal._PROXY_METER_PROVIDER._meters.clear()
+    opentelemetry.metrics._internal._PROXY_METER_PROVIDER._real_meter_provider = None
 
 
 class OTelProviderSnapshot:
@@ -135,8 +141,12 @@ class OTelMocker:
     def install(self):
         self._snapshot = OTelProviderSnapshot()
         _bypass_otel_once()
-        self._install_logs()
+        # MeterProvider must be set FIRST — LoggerProvider internally creates
+        # meters on the global meter provider.  If that is still the
+        # _ProxyMeterProvider, proxy meters accumulate and a subsequent
+        # restore() → set_meter_provider(_ProxyMeterProvider) deadlocks.
         self._install_metrics()
+        self._install_logs()
         self._install_traces()
 
     def uninstall(self):

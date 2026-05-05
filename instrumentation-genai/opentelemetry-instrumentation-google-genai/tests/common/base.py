@@ -18,9 +18,7 @@ from unittest.mock import patch
 
 import google.genai
 
-from opentelemetry.instrumentation._semconv import (
-    _OpenTelemetrySemanticConventionStability,
-)
+from opentelemetry.util.genai import handler as genai_handler
 
 from .auth import FakeCredentials
 from .instrumentation_context import InstrumentationContext
@@ -29,18 +27,21 @@ from .otel_mocker import OTelMocker
 
 class TestCase(unittest.TestCase):
     def setUp(self):
-        # Most tests want this environment variable setup. Need to figure out a less hacky way of doing this.
-        with patch.dict(
+        # Set up environment variables for TelemetryHandler emitters and content capture
+        self._env_patcher = patch.dict(
             "os.environ",
             {
                 "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
-                "OTEL_SEMCONV_STABILITY_OPT_IN": "default",
+                "OTEL_INSTRUMENTATION_GENAI_EMITTERS": "span_metric_event",
+                "OTEL_INSTRUMENTATION_GENAI_EVALS_EVALUATORS": "none",
+                "OTEL_INSTRUMENTATION_GENAI_DISABLE_DEFAULT_COMPLETION_CALLBACKS": "true",
             },
-        ):
-            _OpenTelemetrySemanticConventionStability._initialized = False
-            _OpenTelemetrySemanticConventionStability._initialize()
+        )
+        self._env_patcher.start()
         self._otel = OTelMocker()
         self._otel.install()
+        # Reset TelemetryHandler singleton AFTER providers are installed
+        genai_handler.TelemetryHandler._reset_for_testing()
         self._instrumentation_context = None
         self._api_key = "test-api-key"
         self._project = "test-project"
@@ -97,3 +98,5 @@ class TestCase(unittest.TestCase):
         if self._instrumentation_context is not None:
             self._instrumentation_context.uninstall()
         self._otel.uninstall()
+        self._env_patcher.stop()
+        genai_handler.TelemetryHandler._reset_for_testing()

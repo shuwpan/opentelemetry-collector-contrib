@@ -270,6 +270,10 @@ class TestCase(unittest.TestCase):
             '[123, "abc"]',
         )
 
+    @unittest.skip(
+        reason="Automatic function calling deferred to PR 3 (HYBIM-664); "
+        "this test exercises legacy _StabilityMode.GEN_AI_LATEST_EXPERIMENTAL."
+    )
     def test_handle_with_new_sem_conv(self):
         def somefunction(arg=None):
             pass

@@ -14,8 +14,18 @@
 
 import asyncio
 
+import pytest
+
 from .nonstreaming_base import NonStreamingTestCase
 from .streaming_base import StreamingTestCase
+
+# Streaming instrumentation is deferred to PR 2 (HYBIM-665). The
+# generate_content_stream / async_generate_content_stream methods are
+# currently passthrough — they emit no spans, metrics, or events — so
+# any inherited assertions cannot pass.
+pytestmark = pytest.mark.skip(
+    reason="Streaming instrumentation deferred to PR 2 (HYBIM-665)."
+)
 
 
 class AsyncStreamingMixin:
