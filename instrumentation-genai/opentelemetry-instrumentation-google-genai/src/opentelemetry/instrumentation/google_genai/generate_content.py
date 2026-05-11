@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import functools
 import json
 import logging
 import os
+import timeit
 from typing import Any, Optional, Union
 
 from google.genai.models import AsyncModels, Models
 from google.genai.models import t as transformers
 from google.genai.types import (
     BlockedReason,
+    Candidate,
+    Content,
     ContentListUnion,
     ContentListUnionDict,
     ContentUnion,
@@ -36,11 +40,13 @@ from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes,
 )
 from opentelemetry.util.genai.attributes import (
+    GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
     SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY,
 )
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.types import (
     Error,
+    ErrorClassification,
     InputMessage,
     LLMInvocation,
 )
@@ -60,6 +66,10 @@ _logger = logging.getLogger(__name__)
 
 _SYNC_CODE_FUNCTION_NAME = "google.genai.Models.generate_content"
 _ASYNC_CODE_FUNCTION_NAME = "google.genai.AsyncModels.generate_content"
+_SYNC_STREAM_CODE_FUNCTION_NAME = "google.genai.Models.generate_content_stream"
+_ASYNC_STREAM_CODE_FUNCTION_NAME = (
+    "google.genai.AsyncModels.generate_content_stream"
+)
 
 # Constant used for the value of 'gen_ai.operation.name".
 _GENERATE_CONTENT_OP_NAME = "generate_content"
@@ -471,7 +481,291 @@ def _apply_response(
 
 
 # ---------------------------------------------------------------------------
-# Instrumented wrapper functions (sync + async, no streaming yet)
+# Streaming accumulation helpers
+# ---------------------------------------------------------------------------
+
+
+def _merge_candidates_by_index(
+    candidates: list[Candidate],
+) -> list[Candidate]:
+    """Group streaming candidates by index, concatenating content parts.
+
+    In Gemini streaming each chunk yields one ``Candidate`` at a given
+    ``index`` with a partial text delta.  This helper merges all deltas
+    for the same index into a single ``Candidate`` so that downstream
+    ``to_output_messages`` emits one ``OutputMessage`` per choice index
+    — matching non-streaming behaviour.
+
+    ``finish_reason`` and ``safety_ratings`` are taken from the **last**
+    candidate for each index (that is when the SDK provides them).
+    """
+    if not candidates:
+        return []
+
+    groups: dict[int, list] = {}
+    for candidate in candidates:
+        idx = candidate.index if candidate.index is not None else 0
+        groups.setdefault(idx, []).append(candidate)
+
+    merged: list = []
+    for idx in sorted(groups):
+        group = groups[idx]
+        all_parts: list = []
+        for c in group:
+            if c.content and c.content.parts:
+                all_parts.extend(c.content.parts)
+        last = group[-1]
+        merged_content = (
+            Content(parts=all_parts, role="model") if all_parts else None
+        )
+        merged.append(
+            Candidate(
+                index=idx,
+                content=merged_content,
+                finish_reason=last.finish_reason,
+                safety_ratings=getattr(last, "safety_ratings", None),
+            )
+        )
+    return merged
+
+
+def _build_accumulated_response(
+    chunks: list[GenerateContentResponse],
+) -> GenerateContentResponse:
+    """Build a synthetic response from accumulated streaming chunks.
+
+    * Candidates from all chunks are grouped by ``candidate.index`` and
+      merged — content parts are concatenated, ``finish_reason`` and
+      ``safety_ratings`` are taken from the last chunk for each index.
+      This produces one ``OutputMessage`` per choice index, matching
+      non-streaming telemetry shape.
+    * ``usage_metadata`` is taken from the **last** chunk that carries it
+      (the SDK provides cumulative counts on every chunk; the last one is
+      the most complete).
+    * ``model_version`` and ``response_id`` are taken from the **first**
+      chunk that provides them.
+    * ``prompt_feedback`` is taken from the **first** chunk that has it
+      (a blocked-prompt signal is emitted immediately).
+    """
+    if not chunks:
+        return GenerateContentResponse(candidates=[])
+
+    all_candidates: list = []
+    model_version = None
+    response_id = None
+    last_usage = None
+    prompt_feedback = None
+
+    for chunk in chunks:
+        if chunk.candidates:
+            all_candidates.extend(chunk.candidates)
+        if model_version is None:
+            mv = getattr(chunk, "model_version", None)
+            if mv:
+                model_version = mv
+        if response_id is None:
+            rid = getattr(chunk, "response_id", None)
+            if rid:
+                response_id = rid
+        usage = getattr(chunk, "usage_metadata", None)
+        if usage is not None:
+            last_usage = usage
+        if prompt_feedback is None:
+            pf = getattr(chunk, "prompt_feedback", None)
+            if pf:
+                prompt_feedback = pf
+
+    all_candidates = _merge_candidates_by_index(all_candidates)
+
+    kwargs: dict[str, Any] = {
+        "candidates": all_candidates if all_candidates else None,
+        "usage_metadata": last_usage,
+        "model_version": model_version,
+        "response_id": response_id,
+    }
+    if prompt_feedback is not None:
+        kwargs["prompt_feedback"] = prompt_feedback
+    return GenerateContentResponse(**kwargs)
+
+
+def _classify_error(error: BaseException) -> ErrorClassification:
+    """Map an exception to the appropriate ``ErrorClassification``."""
+    if isinstance(error, KeyboardInterrupt):
+        return ErrorClassification.INTERRUPT
+    if isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+        return ErrorClassification.CANCELLATION
+    return ErrorClassification.REAL_ERROR
+
+
+class _StreamFinalizer:
+    """Shared finalization logic for sync and async stream wrappers.
+
+    Subclasses must set ``self._invocation``, ``self._handler``, and
+    ``self._chunks`` before any iteration begins.  The ``_record_ttfc``
+    helper should be called on the first received chunk.
+    """
+
+    _invocation: LLMInvocation
+    _handler: TelemetryHandler
+    _chunks: list[GenerateContentResponse]
+    _finished: bool
+    _first_chunk_received: bool
+
+    def _init_finalizer(
+        self,
+        invocation: LLMInvocation,
+        handler: TelemetryHandler,
+    ):
+        self._invocation = invocation
+        self._handler = handler
+        self._chunks: list[GenerateContentResponse] = []
+        self._finished = False
+        self._first_chunk_received = False
+
+    def _record_ttfc(self):
+        """Record time-to-first-chunk on the first received chunk."""
+        if not self._first_chunk_received:
+            self._first_chunk_received = True
+            self._invocation.attributes[
+                GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK
+            ] = timeit.default_timer() - self._invocation.start_time
+
+    def __del__(self):
+        self._finalize()
+
+    def _finalize(self):
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            accumulated = _build_accumulated_response(self._chunks)
+            response_error = _apply_response(self._invocation, accumulated)
+            if response_error is None:
+                self._handler.stop_llm(self._invocation)
+            else:
+                self._handler.fail_llm(self._invocation, response_error)
+        except Exception:
+            _logger.exception("Failed to apply streaming response telemetry")
+            try:
+                self._handler.stop_llm(self._invocation)
+            except Exception:
+                pass
+
+    def _handle_error(self, error):
+        if self._finished:
+            return
+        self._finished = True
+        if self._chunks:
+            try:
+                accumulated = _build_accumulated_response(self._chunks)
+                # Note: _apply_response return value (Optional[Error]) is
+                # intentionally discarded — the real exception takes
+                # precedence over synthetic response errors.
+                _apply_response(self._invocation, accumulated)
+            except Exception:
+                _logger.debug(
+                    "Failed to apply partial response on error",
+                    exc_info=True,
+                )
+        classification = _classify_error(error)
+        self._handler.fail_llm(
+            self._invocation,
+            Error(
+                message=str(error),
+                type=type(error),
+                classification=classification,
+            ),
+        )
+
+
+class _SyncStreamWrapper(_StreamFinalizer):
+    """Wraps a sync streaming iterator, accumulating chunks for telemetry.
+
+    Each ``__next__`` call transparently forwards the chunk to the caller
+    while recording it for later aggregation.  On normal exhaustion
+    (``StopIteration``), on error, or on early exit (``close``), the
+    accumulated data is applied to the ``LLMInvocation`` and the span is
+    finalised via the handler.
+    """
+
+    def __init__(
+        self,
+        stream,
+        invocation: LLMInvocation,
+        handler: TelemetryHandler,
+    ):
+        self._stream = iter(stream)
+        self._init_finalizer(invocation, handler)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> GenerateContentResponse:
+        try:
+            chunk = next(self._stream)
+            self._record_ttfc()
+            self._chunks.append(chunk)
+            return chunk
+        except StopIteration:
+            self._finalize()
+            raise
+        except BaseException as error:
+            self._handle_error(error)
+            raise
+
+    def close(self):
+        """Finalize the span and delegate to the underlying stream."""
+        self._finalize()
+        if hasattr(self._stream, "close"):
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+
+
+class _AsyncStreamWrapper(_StreamFinalizer):
+    """Wraps an async streaming iterator, accumulating chunks for telemetry.
+
+    Async counterpart of ``_SyncStreamWrapper``.
+    """
+
+    def __init__(
+        self,
+        stream,
+        invocation: LLMInvocation,
+        handler: TelemetryHandler,
+    ):
+        self._stream = stream.__aiter__()
+        self._init_finalizer(invocation, handler)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> GenerateContentResponse:
+        try:
+            chunk = await self._stream.__anext__()
+            self._record_ttfc()
+            self._chunks.append(chunk)
+            return chunk
+        except StopAsyncIteration:
+            self._finalize()
+            raise
+        except BaseException as error:
+            self._handle_error(error)
+            raise
+
+    async def aclose(self):
+        """Finalize the span and delegate to the underlying stream."""
+        self._finalize()
+        if hasattr(self._stream, "aclose"):
+            try:
+                await self._stream.aclose()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Instrumented wrapper functions (sync + async)
 # ---------------------------------------------------------------------------
 
 
@@ -548,15 +842,56 @@ def _create_instrumented_generate_content_stream(
     handler: TelemetryHandler,
     generate_content_config_key_allowlist: AllowList,
 ):
-    # Streaming is deferred (HYBIM-665). Wrap so the log fires per call.
-    original = snapshot.generate_content_stream
+    wrapped_func = snapshot.generate_content_stream
 
-    @functools.wraps(original)
-    def passthrough(self, *args, **kwargs):
-        _logger.debug("generate_content_stream not instrumented (HYBIM-665)")
-        return original(self, *args, **kwargs)
+    @functools.wraps(wrapped_func)
+    def instrumented_generate_content_stream(
+        self: Models,
+        *,
+        model: str,
+        contents: Union[ContentListUnion, ContentListUnionDict],
+        config: Optional[GenerateContentConfigOrDict] = None,
+        **kwargs: Any,
+    ):
+        if context_api.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY):
+            return wrapped_func(
+                self,
+                model=model,
+                contents=contents,
+                config=config,
+                **kwargs,
+            )
+        invocation = _build_invocation(
+            self,
+            model,
+            contents,
+            config,
+            generate_content_config_key_allowlist,
+        )
+        invocation.request_stream = True
+        handler.start_llm(invocation)
+        if invocation.span and invocation.span.is_recording():
+            invocation.span.set_attribute(
+                code_attributes.CODE_FUNCTION_NAME,
+                _SYNC_STREAM_CODE_FUNCTION_NAME,
+            )
+        try:
+            stream = wrapped_func(
+                self,
+                model=model,
+                contents=contents,
+                config=config,
+                **kwargs,
+            )
+        except Exception as error:
+            handler.fail_llm(
+                invocation,
+                Error(message=str(error), type=type(error)),
+            )
+            raise
+        return _SyncStreamWrapper(stream, invocation, handler)
 
-    return passthrough
+    return instrumented_generate_content_stream
 
 
 def _create_instrumented_async_generate_content(
@@ -632,17 +967,56 @@ def _create_instrumented_async_generate_content_stream(
     handler: TelemetryHandler,
     generate_content_config_key_allowlist: AllowList,
 ):
-    # Streaming is deferred (HYBIM-665). Wrap so the log fires per call.
-    original = snapshot.async_generate_content_stream
+    wrapped_func = snapshot.async_generate_content_stream
 
-    @functools.wraps(original)
-    async def passthrough(self, *args, **kwargs):
-        _logger.debug(
-            "async_generate_content_stream not instrumented (HYBIM-665)"
+    @functools.wraps(wrapped_func)
+    async def instrumented_async_generate_content_stream(
+        self: AsyncModels,
+        *,
+        model: str,
+        contents: Union[ContentListUnion, ContentListUnionDict],
+        config: Optional[GenerateContentConfigOrDict] = None,
+        **kwargs: Any,
+    ):
+        if context_api.get_value(SUPPRESS_LANGUAGE_MODEL_INSTRUMENTATION_KEY):
+            return await wrapped_func(
+                self,
+                model=model,
+                contents=contents,
+                config=config,
+                **kwargs,
+            )
+        invocation = _build_invocation(
+            self,
+            model,
+            contents,
+            config,
+            generate_content_config_key_allowlist,
         )
-        return await original(self, *args, **kwargs)
+        invocation.request_stream = True
+        handler.start_llm(invocation)
+        if invocation.span and invocation.span.is_recording():
+            invocation.span.set_attribute(
+                code_attributes.CODE_FUNCTION_NAME,
+                _ASYNC_STREAM_CODE_FUNCTION_NAME,
+            )
+        try:
+            stream = await wrapped_func(
+                self,
+                model=model,
+                contents=contents,
+                config=config,
+                **kwargs,
+            )
+        except Exception as error:
+            handler.fail_llm(
+                invocation,
+                Error(message=str(error), type=type(error)),
+            )
+            raise
+        return _AsyncStreamWrapper(stream, invocation, handler)
 
-    return passthrough
+    return instrumented_async_generate_content_stream
 
 
 # ---------------------------------------------------------------------------

@@ -7,11 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-- Migrate `generate_content` (sync + async) instrumentation to `TelemetryHandler` / `LLMInvocation` (HYBIM-663).
-- **BREAKING**: `generate_content_stream` / `async_generate_content_stream` are temporarily uninstrumented until HYBIM-665.
-- **BREAKING**: `inline_data`, `file_data`, and `function_call` message parts are temporarily dropped until HYBIM-604.
-- **BREAKING**: The `completion_hook` instrumentor kwarg is no longer supported.
-- Shorten Google GenAI e2e cassette filenames so the repository can be checked out on Windows runners.
+- Migrate to `TelemetryHandler` / `LLMInvocation` with streaming support (HYBIM-663, HYBIM-674).
 
 ## Version 0.7b0 (2026-02-20)
 - Fix bug in how tokens are counted when using the streaming `generateContent` method.  ([#4152](https://github.com/open-telemetry/opentelemetry-python-contrib/pull/4152)).

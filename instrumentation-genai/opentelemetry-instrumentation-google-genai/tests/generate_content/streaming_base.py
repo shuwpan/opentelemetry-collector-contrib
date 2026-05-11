@@ -26,6 +26,7 @@ from opentelemetry.instrumentation.google_genai import (
 )
 
 from .base import TestCase
+from .util import create_response
 
 
 class StreamingTestCase(TestCase):
@@ -44,6 +45,21 @@ class StreamingTestCase(TestCase):
     def expected_function_name(self):
         raise NotImplementedError("Must implement 'expected_function_name'.")
 
+    def test_span_has_request_stream_attribute(self):
+        self.configure_valid_response(text="hi")
+        self.generate_content(model="gemini-2.0-flash", contents="hi")
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        self.assertEqual(span.attributes.get("gen_ai.request.stream"), True)
+
+    def test_span_has_time_to_first_chunk(self):
+        self.configure_valid_response(text="hello")
+        self.generate_content(model="gemini-2.0-flash", contents="hi")
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        ttfc = span.attributes.get("gen_ai.response.time_to_first_chunk")
+        self.assertIsNotNone(ttfc)
+        self.assertIsInstance(ttfc, float)
+        self.assertGreaterEqual(ttfc, 0.0)
+
     def test_instrumentation_does_not_break_core_functionality(self):
         self.configure_valid_response(text="Yep, it works!")
         responses = self.generate_content(
@@ -58,7 +74,7 @@ class StreamingTestCase(TestCase):
         tok = context_api.attach(
             context_api.set_value(
                 GENERATE_CONTENT_EXTRA_ATTRIBUTES_CONTEXT_KEY,
-                {"extra_attribute_key": "extra_attribute_value"},
+                {"custom_extra_attribute_key": "extra_attribute_value"},
             )
         )
         try:
@@ -72,12 +88,13 @@ class StreamingTestCase(TestCase):
                 "generate_content gemini-2.0-flash"
             )
             self.assertEqual(
-                span.attributes["extra_attribute_key"], "extra_attribute_value"
+                span.attributes["custom_extra_attribute_key"],
+                "extra_attribute_value",
             )
         finally:
             context_api.detach(tok)
 
-    def test_handles_multiple_ressponses(self):
+    def test_handles_multiple_responses(self):
         self.configure_valid_response(text="First response")
         self.configure_valid_response(text="Second response")
         responses = self.generate_content(
@@ -86,8 +103,18 @@ class StreamingTestCase(TestCase):
         self.assertEqual(len(responses), 2)
         self.assertEqual(responses[0].text, "First response")
         self.assertEqual(responses[1].text, "Second response")
-        choice_events = self.otel.get_events_named("gen_ai.choice")
-        self.assertEqual(len(choice_events), 2)
+        self.otel.assert_has_span_named("generate_content gemini-2.0-flash")
+        self.otel.assert_has_event_named(
+            "gen_ai.client.inference.operation.details"
+        )
+        # Verify that streaming deltas were merged into a single output
+        # message (both chunks share candidate index 0).
+        event = self.otel.get_event_named(
+            "gen_ai.client.inference.operation.details"
+        )
+        body = event.body or {}
+        output_messages = body.get("gen_ai.output.messages", [])
+        self.assertEqual(len(output_messages), 1)
 
     def test_includes_token_counts_in_span_not_aggregated_from_responses(self):
         # Tokens should not be aggregated in streaming. Cumulative counts are returned on each response.
@@ -102,7 +129,7 @@ class StreamingTestCase(TestCase):
         self.assertEqual(span.attributes["gen_ai.usage.input_tokens"], 3)
         self.assertEqual(span.attributes["gen_ai.usage.output_tokens"], 5)
 
-    def test_new_semconv_log_has_extra_genai_attributes(self):
+    def test_new_semconv_log_has_genai_attributes(self):
         patched_environ = patch.dict(
             "os.environ",
             {
@@ -118,26 +145,61 @@ class StreamingTestCase(TestCase):
         )
         with patched_environ, patched_otel_mapping:
             self.configure_valid_response(text="Yep, it works!")
-            tok = context_api.attach(
-                context_api.set_value(
-                    GENERATE_CONTENT_EXTRA_ATTRIBUTES_CONTEXT_KEY,
-                    {"extra_attribute_key": "extra_attribute_value"},
-                )
+            self.generate_content(
+                model="gemini-2.0-flash",
+                contents="Does this work?",
             )
-            try:
-                self.generate_content(
-                    model="gemini-2.0-flash",
-                    contents="Does this work?",
-                )
-                self.otel.assert_has_event_named(
-                    "gen_ai.client.inference.operation.details"
-                )
-                event = self.otel.get_event_named(
-                    "gen_ai.client.inference.operation.details"
-                )
-                assert (
-                    event.attributes["extra_attribute_key"]
-                    == "extra_attribute_value"
-                )
-            finally:
-                context_api.detach(tok)
+            self.otel.assert_has_event_named(
+                "gen_ai.client.inference.operation.details"
+            )
+            event = self.otel.get_event_named(
+                "gen_ai.client.inference.operation.details"
+            )
+            self.assertEqual(
+                event.attributes["gen_ai.operation.name"],
+                "generate_content",
+            )
+            self.assertEqual(
+                event.attributes["gen_ai.request.model"],
+                "gemini-2.0-flash",
+            )
+
+    # ------------------------------------------------------------- error path
+
+    def test_mid_stream_error_records_error_span(self):
+        # Trigger mock creation, then override side_effect to yield one
+        # chunk and then raise.
+        self.configure_valid_response(text="Partial chunk")
+
+        def _error_after_first(*args, **kwargs):
+            yield create_response(
+                text="Partial", input_tokens=5, output_tokens=3
+            )
+            raise RuntimeError("Connection lost")
+
+        self.mock_generate_content_stream.side_effect = _error_after_first
+
+        with self.assertRaises(RuntimeError):
+            self.generate_content(model="gemini-2.0-flash", contents="Hello")
+
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        self.assertIsNotNone(span)
+        self.assertEqual(span.attributes.get("error.type"), "RuntimeError")
+        # Partial token data should still be recorded from the chunk
+        # received before the error.
+        self.assertEqual(span.attributes.get("gen_ai.usage.input_tokens"), 5)
+        self.assertEqual(span.attributes.get("gen_ai.usage.output_tokens"), 3)
+
+    def test_empty_stream_produces_error_span(self):
+        # Create mocks, then clear responses so the stream yields nothing.
+        self.configure_valid_response(text="dummy")
+        self._responses.clear()
+
+        self.generate_content(model="gemini-2.0-flash", contents="Hello")
+
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        self.assertIsNotNone(span)
+        self.assertEqual(
+            span.attributes.get("error.type"),
+            "NoCandidatesError",
+        )
