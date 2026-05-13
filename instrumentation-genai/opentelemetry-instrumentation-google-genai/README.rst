@@ -58,7 +58,7 @@ Make sure to configure OpenTelemetry tracing, logging, metrics, and events to ca
 
     client = Client()
     response = client.models.generate_content(
-        model="gemini-1.5-flash-002",
+        model="gemini-2.5-flash",
         contents="Write a short poem on OpenTelemetry."
     )
 

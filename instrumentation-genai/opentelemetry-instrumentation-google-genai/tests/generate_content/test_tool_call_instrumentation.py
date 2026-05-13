@@ -12,30 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from unittest.mock import patch
 
 import google.genai.types as genai_types
-import pytest
 
-from opentelemetry.instrumentation._semconv import (
-    _OpenTelemetrySemanticConventionStability,
-    _OpenTelemetryStabilitySignalType,
-    _StabilityMode,
-)
 from opentelemetry.util.genai.types import ContentCapturingMode
 
 from .base import TestCase
 
-# Automatic function calling instrumentation is deferred to PR 3
-# (HYBIM-664). All assertions in this module rely on the upstream
-# ``tool_call_wrapper`` integration, which is not part of the PR 1
-# TelemetryHandler / LLMInvocation migration.
-pytestmark = pytest.mark.skip(
-    reason="Automatic function calling deferred to PR 3 (HYBIM-664)."
-)
-
 
 class ToolCallInstrumentationTestCase(TestCase):
+    def test_tool_call_span_has_gemini_system(self):
+        """gen_ai.system propagates from generate_content to tool execution spans."""
+        calls = []
+
+        def handle(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "some result"
+
+        def somefunction(somearg):
+            pass
+
+        self.mock_generate_content.side_effect = handle
+        self.client.models.generate_content(
+            model="some-model-name",
+            contents="Some content",
+            config={"tools": [somefunction]},
+        )
+        config = calls[0][1]["config"]
+        wrapped_somefunction = config["tools"][0]
+        wrapped_somefunction("someparam")
+        span = self.otel.get_span_named("execute_tool somefunction")
+        self.assertIsNotNone(span)
+        self.assertEqual(span.attributes["gen_ai.system"], "gemini")
+
+    def test_tool_call_span_has_vertex_ai_system(self):
+        """gen_ai.system is vertex_ai when vertexai=True."""
+        self.set_use_vertex(True)
+        calls = []
+
+        def handle(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "some result"
+
+        def somefunction(somearg):
+            pass
+
+        self.mock_generate_content.side_effect = handle
+        self.client.models.generate_content(
+            model="some-model-name",
+            contents="Some content",
+            config={"tools": [somefunction]},
+        )
+        config = calls[0][1]["config"]
+        wrapped_somefunction = config["tools"][0]
+        wrapped_somefunction("someparam")
+        span = self.otel.get_span_named("execute_tool somefunction")
+        self.assertIsNotNone(span)
+        self.assertEqual(span.attributes["gen_ai.system"], "vertex_ai")
+
     def test_tool_calls_with_config_dict_outputs_spans(self):
         calls = []
 
@@ -56,7 +92,7 @@ class ToolCallInstrumentationTestCase(TestCase):
         )
         self.assertEqual(len(calls), 1)
         config = calls[0][1]["config"]
-        tools = config.tools
+        tools = config["tools"]
         wrapped_somefunction = tools[0]
 
         self.assertIsNone(
@@ -65,7 +101,6 @@ class ToolCallInstrumentationTestCase(TestCase):
         wrapped_somefunction("someparam")
         self.otel.assert_has_span_named("execute_tool somefunction")
         generated_span = self.otel.get_span_named("execute_tool somefunction")
-        self.assertIn("gen_ai.system", generated_span.attributes)
         self.assertEqual(
             generated_span.attributes["gen_ai.tool.name"], "somefunction"
         )
@@ -105,7 +140,6 @@ class ToolCallInstrumentationTestCase(TestCase):
         wrapped_somefunction("someparam")
         self.otel.assert_has_span_named("execute_tool somefunction")
         generated_span = self.otel.get_span_named("execute_tool somefunction")
-        self.assertIn("gen_ai.system", generated_span.attributes)
         self.assertEqual(
             generated_span.attributes["gen_ai.tool.name"], "somefunction"
         )
@@ -140,7 +174,7 @@ class ToolCallInstrumentationTestCase(TestCase):
         )
         self.assertEqual(len(calls), 1)
         config = calls[0][1]["config"]
-        tools = config.tools
+        tools = config["tools"]
         wrapped_somefunction = tools[0]
         wrapped_somefunction(123, otherparam="abc")
         self.otel.assert_has_span_named("execute_tool somefunction")
@@ -194,7 +228,7 @@ class ToolCallInstrumentationTestCase(TestCase):
         )
         self.assertEqual(len(calls), 1)
         config = calls[0][1]["config"]
-        tools = config.tools
+        tools = config["tools"]
         wrapped_somefunction = tools[0]
         wrapped_somefunction(123, otherparam="abc")
         self.otel.assert_has_span_named("execute_tool somefunction")
@@ -244,7 +278,7 @@ class ToolCallInstrumentationTestCase(TestCase):
         )
         self.assertEqual(len(calls), 1)
         config = calls[0][1]["config"]
-        tools = config.tools
+        tools = config["tools"]
         wrapped_somefunction = tools[0]
         wrapped_somefunction(123)
         self.otel.assert_has_span_named("execute_tool somefunction")
@@ -280,7 +314,7 @@ class ToolCallInstrumentationTestCase(TestCase):
         )
         self.assertEqual(len(calls), 1)
         config = calls[0][1]["config"]
-        tools = config.tools
+        tools = config["tools"]
         wrapped_somefunction = tools[0]
         wrapped_somefunction(123)
         self.otel.assert_has_span_named("execute_tool somefunction")
@@ -299,20 +333,13 @@ class ToolCallInstrumentationTestCase(TestCase):
                 "os.environ",
                 {
                     "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": mode.name,
-                    "OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental",
-                },
-            )
-            patched_otel_mapping = patch.dict(
-                _OpenTelemetrySemanticConventionStability._OTEL_SEMCONV_STABILITY_SIGNAL_MAPPING,
-                {
-                    _OpenTelemetryStabilitySignalType.GEN_AI: _StabilityMode.GEN_AI_LATEST_EXPERIMENTAL
                 },
             )
             with self.subTest(
                 f"mode: {mode}", patched_environ=patched_environ
             ):
                 self.setUp()
-                with patched_environ, patched_otel_mapping:
+                with patched_environ:
 
                     def handle(*args, **kwargs):
                         calls.append((args, kwargs))  # pylint: disable=cell-var-from-loop
@@ -335,7 +362,7 @@ class ToolCallInstrumentationTestCase(TestCase):
                     )
                     self.assertEqual(len(calls), 1)
                     config = calls[0][1]["config"]
-                    tools = config.tools
+                    tools = config["tools"]
                     wrapped_somefunction = tools[0]
                     wrapped_somefunction(123, otherparam="abc")
                     self.otel.assert_has_span_named(
@@ -383,6 +410,76 @@ class ToolCallInstrumentationTestCase(TestCase):
                         )
                 self.tearDown()
 
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_TOOL_DEFINITIONS": "true",
+        },
+    )
+    def test_tool_definitions_on_span_when_capture_enabled(self):
+        """gen_ai.tool.definitions appears on the LLM span when opted-in."""
+
+        def get_weather(city: str):
+            """Get weather for a city."""
+            return f"sunny in {city}"
+
+        self.configure_valid_response(text="ok")
+        self.client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents="What is the weather?",
+            config={"tools": [get_weather]},
+        )
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        self.assertIsNotNone(span, "LLM span not found")
+        self.assertIn("gen_ai.tool.definitions", span.attributes)
+        defs = json.loads(span.attributes["gen_ai.tool.definitions"])
+        self.assertEqual(len(defs), 1)
+        self.assertEqual(defs[0]["name"], "get_weather")
+        self.assertEqual(defs[0]["type"], "function")
+        self.assertEqual(defs[0]["description"], "Get weather for a city.")
+
+    def test_tool_definitions_absent_when_not_opted_in(self):
+        """gen_ai.tool.definitions is absent by default (env var unset)."""
+
+        def get_weather(city: str):
+            """Get weather for a city."""
+            return f"sunny in {city}"
+
+        self.configure_valid_response(text="ok")
+        self.client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents="What is the weather?",
+            config={"tools": [get_weather]},
+        )
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        self.assertIsNotNone(span, "LLM span not found")
+        self.assertNotIn("gen_ai.tool.definitions", span.attributes)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "false",
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_TOOL_DEFINITIONS": "true",
+        },
+    )
+    def test_tool_definitions_absent_when_content_capture_disabled(self):
+        """gen_ai.tool.definitions requires both env vars — tool defs alone is not enough."""
+
+        def get_weather(city: str):
+            """Get weather for a city."""
+            return f"sunny in {city}"
+
+        self.configure_valid_response(text="ok")
+        self.client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents="What is the weather?",
+            config={"tools": [get_weather]},
+        )
+        span = self.otel.get_span_named("generate_content gemini-2.0-flash")
+        self.assertIsNotNone(span, "LLM span not found")
+        self.assertNotIn("gen_ai.tool.definitions", span.attributes)
+
     def test_new_semconv_tool_calls_record_return_values(self):
         for mode in ContentCapturingMode:
             calls = []
@@ -390,20 +487,13 @@ class ToolCallInstrumentationTestCase(TestCase):
                 "os.environ",
                 {
                     "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": mode.name,
-                    "OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental",
-                },
-            )
-            patched_otel_mapping = patch.dict(
-                _OpenTelemetrySemanticConventionStability._OTEL_SEMCONV_STABILITY_SIGNAL_MAPPING,
-                {
-                    _OpenTelemetryStabilitySignalType.GEN_AI: _StabilityMode.GEN_AI_LATEST_EXPERIMENTAL
                 },
             )
             with self.subTest(
                 f"mode: {mode}", patched_environ=patched_environ
             ):
                 self.setUp()
-                with patched_environ, patched_otel_mapping:
+                with patched_environ:
 
                     def handle(*args, **kwargs):
                         calls.append((args, kwargs))  # pylint: disable=cell-var-from-loop
@@ -422,7 +512,7 @@ class ToolCallInstrumentationTestCase(TestCase):
                     )
                     self.assertEqual(len(calls), 1)
                     config = calls[0][1]["config"]
-                    tools = config.tools
+                    tools = config["tools"]
                     wrapped_somefunction = tools[0]
                     wrapped_somefunction(123)
                     self.otel.assert_has_span_named(

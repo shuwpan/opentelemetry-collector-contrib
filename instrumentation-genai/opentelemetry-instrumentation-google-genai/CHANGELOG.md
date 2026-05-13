@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 - Migrate to `TelemetryHandler` / `LLMInvocation` with streaming support (HYBIM-663, HYBIM-674).
+- Add automatic instrumentation of callable tool functions passed in `config.tools` with `execute_tool` child spans and `gen_ai.tool.definitions` span attribute (opt-in via `OTEL_INSTRUMENTATION_GENAI_CAPTURE_TOOL_DEFINITIONS=true`) (HYBIM-675).
 
 ## Version 0.7b0 (2026-02-20)
 - Fix bug in how tokens are counted when using the streaming `generateContent` method.  ([#4152](https://github.com/open-telemetry/opentelemetry-python-contrib/pull/4152)).

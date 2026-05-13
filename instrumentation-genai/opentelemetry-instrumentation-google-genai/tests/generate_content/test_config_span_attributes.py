@@ -15,7 +15,6 @@
 import os
 from unittest import mock
 
-import pytest
 from google.genai.types import GenerateContentConfig
 
 from opentelemetry.instrumentation.google_genai.allowlist_util import AllowList
@@ -119,12 +118,6 @@ class ConfigSpanAttributesTestCase(TestCase):
     @mock.patch.dict(
         os.environ, {"OTEL_GOOGLE_GENAI_GENERATE_CONTENT_CONFIG_INCLUDES": "*"}
     )
-    @pytest.mark.skip(
-        reason="Custom 'gcp.gen_ai.operation.config.*' attributes are routed "
-        "through LLMInvocation.attributes; the util-genai SpanEmitter only "
-        "surfaces gen_ai.* / custom_* keys onto the span. Re-enable when "
-        "util-genai supports passthrough of arbitrary supplemental attrs."
-    )
     def test_option_reflected_to_span_attribute_automatic_func_calling(self):
         span = self.generate_and_get_span(
             config={
@@ -152,12 +145,6 @@ class ConfigSpanAttributesTestCase(TestCase):
             span.attributes,
         )
 
-    @pytest.mark.skip(
-        reason="Custom 'gcp.gen_ai.operation.config.*' attributes are routed "
-        "through LLMInvocation.attributes and dropped by the util-genai "
-        "SpanEmitter (gen_ai.* / custom_* prefix only). Re-enable when "
-        "util-genai supports passthrough of arbitrary supplemental attrs."
-    )
     def test_can_supply_allow_list_via_instrumentor_constructor(self):
         self.set_instrumentor_constructor_kwarg(
             "generate_content_config_key_allowlist", AllowList(includes=["*"])

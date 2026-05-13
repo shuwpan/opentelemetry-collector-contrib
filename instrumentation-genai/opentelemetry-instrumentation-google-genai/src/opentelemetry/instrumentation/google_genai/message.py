@@ -25,6 +25,7 @@ from opentelemetry.util.genai.types import (
     MessagePart,
     OutputMessage,
     Text,
+    ToolCall,
     ToolCallResponse,
 )
 
@@ -106,8 +107,8 @@ def _to_part(part: genai_types.Part, idx: int) -> MessagePart | None:
     if (text := part.text) is not None:
         return Text(content=text)
 
-    # Blob (inline_data), Uri (file_data), and ToolCallRequest (function_call)
-    # types are not yet available in util-genai. Skipped until HYBIM-604.
+    # Blob (inline_data) and Uri (file_data) types are not yet available in
+    # util-genai. Skipped until HYBIM-604.
     if part.inline_data:
         _logger.debug("Skipping inline_data part (Blob type not available)")
         return None
@@ -116,11 +117,13 @@ def _to_part(part: genai_types.Part, idx: int) -> MessagePart | None:
         _logger.debug("Skipping file_data part (Uri type not available)")
         return None
 
-    if part.function_call:
-        _logger.debug(
-            "Skipping function_call part (ToolCallRequest type not available)"
+    if call := part.function_call:
+        return ToolCall(
+            name=call.name or "",
+            arguments=call.args,
+            id=getattr(call, "id", None) or tool_call_id(call.name),
+            tool_type="function",
         )
-        return None
 
     if response := part.function_response:
         return ToolCallResponse(
@@ -184,4 +187,4 @@ def _to_finish_reason(
     if finish_reason in _CONTENT_FILTER_REASONS:
         return "content_filter"
     # If there is no 1:1 mapping to an OTel preferred enum value, use the exact reason
-    return finish_reason.name.lower()
+    return finish_reason.value.lower()

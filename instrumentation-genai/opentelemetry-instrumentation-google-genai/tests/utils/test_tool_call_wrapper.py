@@ -13,22 +13,13 @@
 # limitations under the License.
 
 import asyncio
-import os
 import unittest
 from unittest.mock import patch
 
 from google.genai import types as genai_types
 
-from opentelemetry._logs import get_logger_provider
-from opentelemetry.instrumentation._semconv import (
-    _OpenTelemetrySemanticConventionStability,
-)
-from opentelemetry.instrumentation.google_genai import (
-    otel_wrapper,
-    tool_call_wrapper,
-)
-from opentelemetry.metrics import get_meter_provider
-from opentelemetry.trace import get_tracer_provider
+from opentelemetry.instrumentation.google_genai import tool_call_wrapper
+from opentelemetry.util.genai import handler as genai_handler
 from opentelemetry.util.genai.types import ContentCapturingMode
 
 from ..common import otel_mocker
@@ -36,31 +27,33 @@ from ..common import otel_mocker
 
 class TestCase(unittest.TestCase):
     def setUp(self):
+        self._env_patcher = patch.dict(
+            "os.environ",
+            {
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
+                "OTEL_INSTRUMENTATION_GENAI_EMITTERS": "span_metric_event",
+                "OTEL_INSTRUMENTATION_GENAI_EVALS_EVALUATORS": "none",
+                "OTEL_INSTRUMENTATION_GENAI_DISABLE_DEFAULT_COMPLETION_CALLBACKS": "true",
+            },
+        )
+        self._env_patcher.start()
         self._otel = otel_mocker.OTelMocker()
         self._otel.install()
-        self._otel_wrapper = otel_wrapper.OTelWrapper.from_providers(
-            get_tracer_provider(),
-            get_logger_provider(),
-            get_meter_provider(),
-        )
-        os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = (
-            "true"
-        )
-        os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = "default"
-        _OpenTelemetrySemanticConventionStability._initialized = False
-        _OpenTelemetrySemanticConventionStability._initialize()
+        genai_handler.TelemetryHandler._reset_for_testing()
+        self._handler = genai_handler.TelemetryHandler()
+
+    def tearDown(self):
+        self._otel.uninstall()
+        self._env_patcher.stop()
+        genai_handler.TelemetryHandler._reset_for_testing()
 
     @property
     def otel(self):
         return self._otel
 
-    @property
-    def otel_wrapper(self):
-        return self._otel_wrapper
-
     def wrap(self, tool_or_tools, **kwargs):
         return tool_call_wrapper.wrapped(
-            tool_or_tools, self.otel_wrapper, **kwargs
+            tool_or_tools, self._handler, **kwargs
         )
 
     def test_wraps_none(self):
@@ -270,11 +263,7 @@ class TestCase(unittest.TestCase):
             '[123, "abc"]',
         )
 
-    @unittest.skip(
-        reason="Automatic function calling deferred to PR 3 (HYBIM-664); "
-        "this test exercises legacy _StabilityMode.GEN_AI_LATEST_EXPERIMENTAL."
-    )
-    def test_handle_with_new_sem_conv(self):
+    def test_content_capture_respects_mode(self):
         def somefunction(arg=None):
             pass
 
@@ -285,13 +274,8 @@ class TestCase(unittest.TestCase):
                     "os.environ",
                     {
                         "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": mode.name,
-                        "OTEL_SEMCONV_STABILITY_OPT_IN": "gen_ai_latest_experimental",
                     },
                 ):
-                    _OpenTelemetrySemanticConventionStability._initialized = (
-                        False
-                    )
-                    _OpenTelemetrySemanticConventionStability._initialize()
                     wrapped_somefunction = self.wrap(somefunction)
                     wrapped_somefunction(12345)
 

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import timeit
+from enum import Enum
 from typing import Any, Optional, Union
 
 from google.genai.models import AsyncModels, Models
@@ -32,6 +33,7 @@ from google.genai.types import (
     GenerateContentConfig,
     GenerateContentConfigOrDict,
     GenerateContentResponse,
+    Tool,
 )
 
 from opentelemetry import context as context_api
@@ -50,6 +52,7 @@ from opentelemetry.util.genai.types import (
     InputMessage,
     LLMInvocation,
 )
+from opentelemetry.util.genai.utils import should_capture_tool_definitions
 from opentelemetry.util.types import AttributeValue
 
 from .allowlist_util import AllowList
@@ -61,6 +64,7 @@ from .message import (
     to_output_messages,
     to_system_instructions,
 )
+from .tool_call_wrapper import wrapped as wrap_tools
 
 _logger = logging.getLogger(__name__)
 
@@ -240,6 +244,35 @@ def _output_type_from_mime(mime: Optional[str]) -> Optional[str]:
     return mime
 
 
+def _wrap_config_tools(
+    config: Optional[GenerateContentConfigOrDict],
+    handler: TelemetryHandler,
+    system: Optional[str],
+    provider: Optional[str] = None,
+) -> Optional[GenerateContentConfigOrDict]:
+    """Return a copy of config with callable tool functions wrapped for telemetry.
+
+    If config has no tools (or no callable tools), the original config object
+    is returned unchanged to avoid unnecessary copies.
+    """
+    if config is None:
+        return config
+
+    if isinstance(config, dict):
+        tools = config.get("tools")
+        wrapped = wrap_tools(tools, handler, system, provider)
+        if wrapped is tools:
+            return config
+        return {**config, "tools": wrapped}
+
+    tools = getattr(config, "tools", None)
+    wrapped = wrap_tools(tools, handler, system, provider)
+    if wrapped is tools:
+        return config
+    config = config.model_copy(update={"tools": wrapped})
+    return config
+
+
 def _capture_vendor_config_attributes(
     config_dict: dict,
     allow_list: AllowList,
@@ -290,6 +323,91 @@ def _get_response_property(response: GenerateContentResponse, path: str):
 
 
 # ---------------------------------------------------------------------------
+# Tool definition helpers
+# ---------------------------------------------------------------------------
+
+
+def _clean_parameters(params: Any) -> Any:
+    """Convert parameter objects into plain JSON-serializable dicts."""
+    if params is None:
+        return None
+    if isinstance(params, dict):
+        # Recursively convert enum values to strings
+        return {
+            k: v.value if isinstance(v, Enum) else _clean_parameters(v)
+            for k, v in params.items()
+        }
+    if hasattr(params, "model_dump"):
+        return _clean_parameters(params.model_dump(exclude_none=True))
+    if isinstance(params, list):
+        return [_clean_parameters(item) for item in params]
+    if isinstance(params, Enum):
+        return params.value
+    return params
+
+
+def _collect_tool_definitions(
+    config: Optional[GenerateContentConfigOrDict],
+) -> Optional[str]:
+    """Extract tool definitions from config and return as JSON string.
+
+    Covers ``Tool`` objects (with ``function_declarations``) and plain
+    callable functions.  Returns ``None`` when no tools are present.
+    """
+    if config is None:
+        return None
+
+    if isinstance(config, dict):
+        tools = config.get("tools")
+    else:
+        tools = getattr(config, "tools", None)
+
+    if not tools:
+        return None
+
+    definitions: list[dict[str, Any]] = []
+    try:
+        for tool in tools:
+            # Coerce dict-shaped tools (ToolDict) into Tool objects so the
+            # isinstance(tool, Tool) branch handles them uniformly.
+            if isinstance(tool, dict):
+                try:
+                    tool = Tool.model_validate(tool)
+                except Exception:
+                    continue
+
+            if isinstance(tool, Tool):
+                for fd in tool.function_declarations or []:
+                    entry: dict[str, Any] = {
+                        "type": "function",
+                        "name": getattr(fd, "name", None) or type(fd).__name__,
+                    }
+                    desc = getattr(fd, "description", None)
+                    if desc:
+                        entry["description"] = desc
+                    params = getattr(fd, "parameters", None)
+                    if params is not None:
+                        entry["parameters"] = _clean_parameters(params)
+                    definitions.append(entry)
+            elif callable(tool):
+                entry = {
+                    "type": "function",
+                    "name": getattr(tool, "__name__", type(tool).__name__),
+                }
+                doc = getattr(tool, "__doc__", None)
+                if doc:
+                    entry["description"] = doc.strip()
+                definitions.append(entry)
+
+        if not definitions:
+            return None
+        return json.dumps(definitions)
+    except Exception:
+        _logger.debug("Failed to collect tool definitions", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # LLMInvocation builder helpers
 # ---------------------------------------------------------------------------
 
@@ -312,13 +430,17 @@ def _build_invocation(
     # Extract system instructions from config and prepend as a system message
     system_content = _config_to_system_instruction(config)
     if system_content:
-        system_parts = to_system_instructions(
-            content=transformers.t_contents(system_content)[0]
-        )
-        input_messages = [
-            InputMessage(role="system", parts=system_parts),
-            *input_messages,
-        ]
+        try:
+            transformed = transformers.t_contents(system_content)
+        except (ValueError, TypeError):
+            transformed = None
+        if transformed:
+            system_parts = to_system_instructions(content=transformed[0])
+            if system_parts:
+                input_messages = [
+                    InputMessage(role="system", parts=system_parts),
+                    *input_messages,
+                ]
 
     config_dict: dict = _to_dict(config) if config else {}
 
@@ -367,7 +489,29 @@ def _build_invocation(
     # Gemini-specific span attribute: which backend is being targeted.
     invocation.attributes["gen_ai.google.request.backend"] = backend
 
+    # Populate gen_ai.tool.definitions (JSON-serialized tool schemas).
+    # Gated by env var to avoid serialization cost when the feature is disabled.
+    if should_capture_tool_definitions():
+        invocation.tool_definitions = _collect_tool_definitions(config)
+
     return invocation
+
+
+# Prefixes for Google-specific attributes that the util-genai SpanEmitter
+# would filter out (it only passes standard gen_ai.* semconv keys and
+# custom_* keys).  These must be set directly on the span.
+_VENDOR_ATTR_PREFIXES = ("gen_ai.google.", "gcp.gen_ai.")
+
+
+def _set_vendor_attributes_on_span(invocation: LLMInvocation) -> None:
+    """Copy vendor-prefixed attributes from *invocation.attributes* directly
+    onto the span so they survive SpanEmitter filtering."""
+    span = invocation.span
+    if not span or not span.is_recording():
+        return
+    for key, value in (invocation.attributes or {}).items():
+        if any(key.startswith(prefix) for prefix in _VENDOR_ATTR_PREFIXES):
+            span.set_attribute(key, value)
 
 
 def _apply_response(
@@ -439,9 +583,17 @@ def _apply_response(
         cached_content_tokens, bool
     ):
         if cached_content_tokens > 0:
+            # Vendor-specific attribute (set on span via _set_vendor_attributes_on_span).
             invocation.attributes[
                 "gen_ai.google.usage.cached_content_tokens"
             ] = cached_content_tokens
+            # Standard semconv key — set directly on span so it survives
+            # SpanEmitter filtering (which only passes gen_ai.* semconv keys).
+            if invocation.span and invocation.span.is_recording():
+                invocation.span.set_attribute(
+                    gen_ai_attributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                    cached_content_tokens,
+                )
 
     # Token counts. Guard against bool (isinstance(True, int) is True).
     input_tokens = _get_response_property(
@@ -631,7 +783,15 @@ class _StreamFinalizer:
             ] = timeit.default_timer() - self._invocation.start_time
 
     def __del__(self):
-        self._finalize()
+        if not getattr(self, "_finished", True):
+            try:
+                self._finalize()
+            except Exception:  # pragma: no cover
+                # __del__ may run from GC on an arbitrary thread/task where
+                # ContextVar access is invalid.  Swallow to avoid noise.
+                _logger.debug(
+                    "Stream finalizer failed in __del__", exc_info=True
+                )
 
     def _finalize(self):
         if self._finished:
@@ -640,16 +800,13 @@ class _StreamFinalizer:
         try:
             accumulated = _build_accumulated_response(self._chunks)
             response_error = _apply_response(self._invocation, accumulated)
+            _set_vendor_attributes_on_span(self._invocation)
             if response_error is None:
                 self._handler.stop_llm(self._invocation)
             else:
                 self._handler.fail_llm(self._invocation, response_error)
-        except Exception:
-            _logger.exception("Failed to apply streaming response telemetry")
-            try:
-                self._handler.stop_llm(self._invocation)
-            except Exception:
-                pass
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def _handle_error(self, error):
         if self._finished:
@@ -662,6 +819,7 @@ class _StreamFinalizer:
                 # intentionally discarded — the real exception takes
                 # precedence over synthetic response errors.
                 _apply_response(self._invocation, accumulated)
+                _set_vendor_attributes_on_span(self._invocation)
             except Exception:
                 _logger.debug(
                     "Failed to apply partial response on error",
@@ -806,6 +964,10 @@ def _create_instrumented_generate_content(
                 code_attributes.CODE_FUNCTION_NAME,
                 _SYNC_CODE_FUNCTION_NAME,
             )
+        _set_vendor_attributes_on_span(invocation)
+        config = _wrap_config_tools(
+            config, handler, invocation.system, invocation.provider
+        )
         try:
             response = wrapped_func(
                 self,
@@ -822,16 +984,13 @@ def _create_instrumented_generate_content(
             raise
         try:
             response_error = _apply_response(invocation, response)
+            _set_vendor_attributes_on_span(invocation)
             if response_error is None:
                 handler.stop_llm(invocation)
             else:
                 handler.fail_llm(invocation, response_error)
-        except Exception:
-            _logger.exception("Failed to apply response telemetry")
-            try:
-                handler.stop_llm(invocation)
-            except Exception:
-                pass
+        except Exception:  # pragma: no cover - defensive
+            pass
         return response
 
     return instrumented_generate_content
@@ -875,6 +1034,10 @@ def _create_instrumented_generate_content_stream(
                 code_attributes.CODE_FUNCTION_NAME,
                 _SYNC_STREAM_CODE_FUNCTION_NAME,
             )
+        _set_vendor_attributes_on_span(invocation)
+        config = _wrap_config_tools(
+            config, handler, invocation.system, invocation.provider
+        )
         try:
             stream = wrapped_func(
                 self,
@@ -931,6 +1094,10 @@ def _create_instrumented_async_generate_content(
                 code_attributes.CODE_FUNCTION_NAME,
                 _ASYNC_CODE_FUNCTION_NAME,
             )
+        _set_vendor_attributes_on_span(invocation)
+        config = _wrap_config_tools(
+            config, handler, invocation.system, invocation.provider
+        )
         try:
             response = await wrapped_func(
                 self,
@@ -947,16 +1114,13 @@ def _create_instrumented_async_generate_content(
             raise
         try:
             response_error = _apply_response(invocation, response)
+            _set_vendor_attributes_on_span(invocation)
             if response_error is None:
                 handler.stop_llm(invocation)
             else:
                 handler.fail_llm(invocation, response_error)
-        except Exception:
-            _logger.exception("Failed to apply response telemetry")
-            try:
-                handler.stop_llm(invocation)
-            except Exception:
-                pass
+        except Exception:  # pragma: no cover - defensive
+            pass
         return response
 
     return instrumented_generate_content
@@ -1000,6 +1164,10 @@ def _create_instrumented_async_generate_content_stream(
                 code_attributes.CODE_FUNCTION_NAME,
                 _ASYNC_STREAM_CODE_FUNCTION_NAME,
             )
+        _set_vendor_attributes_on_span(invocation)
+        config = _wrap_config_tools(
+            config, handler, invocation.system, invocation.provider
+        )
         try:
             stream = await wrapped_func(
                 self,
