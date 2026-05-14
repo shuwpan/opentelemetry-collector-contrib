@@ -21,6 +21,10 @@ from opentelemetry.trace import get_tracer_provider
 from opentelemetry.util.genai.handler import get_telemetry_handler
 
 from .allowlist_util import AllowList
+from .embed_content import (
+    instrument_embed_content,
+    uninstrument_embed_content,
+)
 from .generate_content import (
     instrument_generate_content,
     uninstrument_generate_content,
@@ -32,6 +36,7 @@ class GoogleGenAiSdkInstrumentor(BaseInstrumentor):
         self, generate_content_config_key_allowlist: Optional[AllowList] = None
     ):
         self._generate_content_snapshot = None
+        self._embed_content_snapshot = None
         self._generate_content_config_key_allowlist = (
             generate_content_config_key_allowlist
             or AllowList.from_env(
@@ -62,6 +67,8 @@ class GoogleGenAiSdkInstrumentor(BaseInstrumentor):
             handler,
             generate_content_config_key_allowlist=self._generate_content_config_key_allowlist,
         )
+        self._embed_content_snapshot = instrument_embed_content(handler)
 
     def _uninstrument(self, **kwargs: Any):
         uninstrument_generate_content(self._generate_content_snapshot)
+        uninstrument_embed_content(self._embed_content_snapshot)
