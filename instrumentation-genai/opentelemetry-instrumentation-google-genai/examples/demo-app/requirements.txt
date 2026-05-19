@@ -1,0 +1,7 @@
+# Google GenAI Demo App — application dependencies
+google-genai>=1.32.0,<2
+opentelemetry-api~=1.40
+opentelemetry-sdk~=1.40
+opentelemetry-exporter-otlp-proto-grpc~=1.40
+python-dotenv>=1.0.0
+litellm

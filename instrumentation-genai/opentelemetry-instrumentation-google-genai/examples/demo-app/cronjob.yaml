@@ -1,0 +1,117 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: otel-google-genai-demo-app
+  namespace: google-genai-agent
+  labels:
+    app: otel-google-genai-demo-app
+    component: genai-instrumentation
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: false
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: otel-google-genai-demo-app
+        spec:
+          containers:
+            - name: otel-google-genai-demo-app
+              image: shuwpan/otel-google-genai-demo-app:latest
+              imagePullPolicy: Always
+              env:
+                # OpenTelemetry configuration
+                - name: OTEL_SERVICE_NAME
+                  value: "otel-google-genai-demo-app"
+                - name: OTEL_RESOURCE_ATTRIBUTES
+                  value: "deployment.environment=o11y-inframon-ai"
+                # OTLP exporter configuration
+                - name: SPLUNK_OTEL_AGENT
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.hostIP
+                - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                  value: "http://$(SPLUNK_OTEL_AGENT):4317"
+                - name: OTEL_EXPORTER_OTLP_PROTOCOL
+                  value: "grpc"
+                - name: OTEL_LOGS_EXPORTER
+                  value: "otlp"
+                - name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+                  value: "DELTA"
+                # Python instrumentation settings
+                - name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED
+                  value: "true"
+                # Google GenAI / Vertex AI configuration
+                - name: GOOGLE_GENAI_USE_VERTEXAI
+                  value: "1"
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: "gcp-o11yinframon-nprd-81065"
+                - name: GOOGLE_CLOUD_LOCATION
+                  value: "us-central1"
+                - name: GOOGLE_APPLICATION_CREDENTIALS
+                  value: "/var/secrets/google/sa-key.json"
+                - name: MODEL
+                  value: "gemini-2.5-flash"
+                - name: EMBED_MODEL
+                  value: "gemini-embedding-001"
+                # GenAI instrumentation settings
+                - name: OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
+                  value: "SPAN_AND_EVENT"
+                - name: OTEL_INSTRUMENTATION_GENAI_CAPTURE_TOOL_DEFINITIONS
+                  value: "true"
+                - name: OTEL_INSTRUMENTATION_GENAI_EMITTERS
+                  value: "span_metric_event,splunk"
+                # Evaluation settings
+                - name: OTEL_INSTRUMENTATION_GENAI_EVALS_EVALUATORS
+                  value: "deepeval(LLMInvocation(bias,toxicity))"
+                - name: OTEL_INSTRUMENTATION_GENAI_EVALS_RESULTS_AGGREGATION
+                  value: "true"
+                - name: OTEL_INSTRUMENTATION_GENAI_EMITTERS_EVALUATION
+                  value: "replace-category:SplunkEvaluationResults"
+                # DeepEval / Circuit configuration
+                - name: DEEPEVAL_FILE_SYSTEM
+                  value: "READ_ONLY"
+                - name: DEEPEVAL_LLM_BASE_URL
+                  value: "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini"
+                - name: DEEPEVAL_LLM_MODEL
+                  value: "gpt-4o-mini"
+                - name: DEEPEVAL_LLM_PROVIDER
+                  value: "openai"
+                - name: DEEPEVAL_LLM_CLIENT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: circuit-oauth-secrets
+                      key: client-id
+                - name: DEEPEVAL_LLM_CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: circuit-oauth-secrets
+                      key: client-secret
+                - name: DEEPEVAL_LLM_TOKEN_URL
+                  value: "https://id.cisco.com/oauth2/default/v1/token"
+                - name: DEEPEVAL_LLM_CLIENT_APP_NAME
+                  value: "egai-prd-other-020027861-newcontent-1770913440554"
+                # Runtime settings
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              volumeMounts:
+                - name: gcp-credentials
+                  mountPath: /var/secrets/google
+                  readOnly: true
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "200m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "1000m"
+          volumes:
+            - name: gcp-credentials
+              secret:
+                secretName: gcp-vertexai-secrets
+          restartPolicy: OnFailure
